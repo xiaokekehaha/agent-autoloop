@@ -257,6 +257,15 @@ function claimNext(draft: Draft, worker: string, claim: string) {
   return jobOf(draft.view, draft.view.get("runs", run.id)!, draft.env);
 }
 
+/** A run whose rule is gone can never be claimed, so it ends here and the owner is told, rather than wait for good. */
+function stopRuleGone(draft: Draft, run: Row, fields: Row = {}) {
+  const summary = "规则已删除或改名，没有再派";
+  put(draft, "runs", run.id, { ...fields, state: "cancelled", finished_at: draft.at, summary });
+  closeOpen(draft, (key) => key === `run:${run.id}:failing`, summary);
+  const words = `规则「${run.rule}」已经删掉或改了名，这一轮还没跑完，不会再派。还要处理的话，在现在的规则下重新触发这件事。`;
+  notify(draft, `run:${run.id}:gone`, run.rule, words, threadOf(run));
+}
+
 /** A run that didn't get through waits to try again, and takes along whatever came in for the same thing meanwhile. */
 function retryLater(draft: Draft, run: Row, result: Result) {
   const { id } = run;
@@ -269,6 +278,10 @@ function retryLater(draft: Draft, run: Row, result: Result) {
     for (const _ of result[what] ?? []) rejected.push({ what, reason: "没跑成的一轮只能发通知" });
   }
   for (const notice of result.notice ?? []) cardFromReceipt(draft, run, "notice", notice);
+  if (!ruleNamed(draft, run.rule)) {
+    stopRuleGone(draft, run, { attempts, error, ...unclaimed });
+    return rejected;
+  }
   if (attempts >= MAX_ATTEMPTS) {
     // Runs queued for this thread stay apart: they came in since, and get their own count and their own go.
     const summary = `连续 ${MAX_ATTEMPTS} 次没跑成，不再自动重试`;
@@ -465,9 +478,12 @@ function tick(draft: Draft) {
 
 /** Every input there is, each with its arguments named. What one returns is what the caller is told. */
 const HANDLERS: Record<string, (draft: Draft, ...args: any[]) => unknown> = {
-  rules(draft, rules) {
+  rules(draft, rules: Rules) {
     put(draft, "config", "rules", { value: rules, version: draft.seq });
-    for (const run of rows(draft.view, "runs", { state: "queued" })) assignQueued(draft, run);
+    for (const run of rows(draft.view, "runs", { state: "queued" })) {
+      if (rules.rules.some((rule) => rule.name === run.rule)) assignQueued(draft, run);
+      else stopRuleGone(draft, run);
+    }
     closeOpen(draft, (key) => key.startsWith("rules:"), "改好了");
   },
   rulesError: (draft, problem) => notify(draft, `rules:${digest(problem)}`, "rules.json 写错了，还在用旧规则", problem),

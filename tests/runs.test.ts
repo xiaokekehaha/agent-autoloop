@@ -11,7 +11,8 @@
 // old token is taken; a failed run's receipt takes effect (it will run again) beyond what it tells the owner; a worker
 // gone with work in hand frees its group while the work may still be going; cancelling frees the thread before the worker
 // has stopped; a retry doesn't get its own session back; retries overwrite usage or replayed results count it twice; a run
-// that keeps failing goes on spending for good, stops without telling the owner, or takes newer events down with it.
+// that keeps failing goes on spending for good, stops without telling the owner, or takes newer events down with it; a
+// run whose rule is removed or renamed, waiting or failing after it, waits for good without a word or is told twice.
 // Reloading rules must not combine an old agent with a new folder, or change an already claimed job and its worker.
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -276,6 +277,82 @@ test("after ten failures in a row a run stops, tells the owner once, and newer e
   );
   finish(next.run, next.token, { outcome: "done", summary: "好了" }, at(10 * step + 2));
   assert.equal(claim("w1", at(100 * step)), null, "nothing is left to run again by itself");
+});
+
+test("a waiting run whose rule is removed or renamed stops and tells the owner once instead of waiting for good", async () => {
+  clean();
+  const hub = await import("../host/runtime.ts");
+  const before = hub.getView().get("config", "rules")!.value;
+  const without = (name: string, rename?: string) => {
+    const next = structuredClone(before);
+    if (rename) next.rules.find((rule: { name: string }) => rule.name === name).name = rename;
+    else next.rules = next.rules.filter((rule: { name: string }) => rule.name !== name);
+    return next;
+  };
+  try {
+    // Already failing three times in a row: its card is open while it waits for the next try.
+    ingest("app", note(1), at(0));
+    let job = claim("w1", at(0))!;
+    const { run: id } = job;
+    finish(id, job.token, { outcome: "failed", error: "没登录" }, at(1));
+    job = claim("w1", at(6))!;
+    finish(id, job.token, { outcome: "failed", error: "没登录" }, at(7));
+    job = claim("w1", at(17))!;
+    finish(id, job.token, { outcome: "failed", error: "没登录" }, at(18));
+    assert.deepEqual(
+      told().map((card) => [card.key, card.state]),
+      [[`run:${id}:failing`, "open"]],
+    );
+    hub.execute("rules", [without("意见")], at(19));
+    assert.equal(state(id), "cancelled");
+    const stopped = one<{ summary: string; finished_at: string }>(
+      "SELECT summary, finished_at FROM runs WHERE id = ?",
+      [id],
+    )!;
+    assert.match(stopped.summary, /规则已删除或改名/);
+    assert.ok(stopped.finished_at);
+    const open = told().filter((card) => card.state === "open");
+    assert.deepEqual(
+      open.map((card) => card.key),
+      [`run:${id}:gone`],
+      "the failing card has been replaced by this one",
+    );
+    assert.match(open[0].text, /意见/);
+    assert.equal(claim("w1", at(1000)), null);
+    hub.execute("rules", [without("巡检")], at(1001));
+    assert.equal(told().filter((card) => card.state === "open").length, 1, "told once, not on every change");
+
+    hub.execute("rules", [before], at(1002));
+    ingest("app", note(2), at(1003));
+    const renamed = one<{ id: number }>("SELECT id FROM runs WHERE state = 'queued' AND rule = '意见'")!.id;
+    hub.execute("rules", [without("意见", "用户意见")], at(1004));
+    assert.equal(state(renamed), "cancelled", "a renamed rule doesn't pick up the old name's work");
+    assert.ok(told().some((card) => card.key === `run:${renamed}:gone` && card.state === "open"));
+  } finally {
+    hub.execute("rules", [before], at(2000));
+  }
+});
+
+test("a run whose rule goes away while it runs, then fails, stops instead of going back to wait for good", async () => {
+  clean();
+  const hub = await import("../host/runtime.ts");
+  const before = hub.getView().get("config", "rules")!.value;
+  const without = structuredClone(before);
+  without.rules = without.rules.filter((rule: { name: string }) => rule.name !== "意见");
+  try {
+    ingest("app", note(1), at(0));
+    const job = claim("w1", at(0))!;
+    hub.execute("rules", [without], at(1));
+    assert.equal(state(job.run), "claimed", "a claimed run keeps going on the configuration it took");
+    finish(job.run, job.token, { outcome: "failed", error: "没登录" }, at(2));
+    assert.equal(state(job.run), "cancelled");
+    assert.deepEqual(
+      told().map((card) => card.key),
+      [`run:${job.run}:gone`],
+    );
+  } finally {
+    hub.execute("rules", [before], at(3));
+  }
 });
 
 test("the owner is told what the rule says: needed only with a card, always every time, never only what blocks work", () => {
